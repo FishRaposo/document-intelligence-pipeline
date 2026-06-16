@@ -1,11 +1,11 @@
 .PHONY: install dev test lint format typecheck docker-up docker-down demo clean help worker migrate upgrade
 
-install: ## Install shared-core and project dependencies
-	pip install -e ../shared-core
-	pip install -r requirements.txt
+install: ## Install shared-core (with extras) and project dependencies
+	pip install -e '../shared-core[dev,docparse,embeddings]'
+	pip install -e '.[dev]'
 
 dev: ## Start the FastAPI development server
-	python src/doc_pipeline/main.py
+	python -m uvicorn doc_pipeline.main:app --app-dir src --reload --port 8000
 
 test: ## Run unit tests with pytest
 	pytest
@@ -29,7 +29,7 @@ demo: ## Run the demonstration script
 	python examples/run_demo.py
 
 worker: ## Start the Celery worker
-	celery -A src.doc_pipeline.worker worker --loglevel=info
+	celery -A doc_pipeline.worker:celery_app worker --loglevel=info
 
 migrate: ## Generate a new Alembic migration
 	alembic revision --autogenerate -m "auto"

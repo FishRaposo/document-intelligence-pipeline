@@ -1,103 +1,81 @@
+"""Document parsing built on ``shared_core.docparse``.
+
+This module is a thin adapter over the shared parsing layer: ``get_parser``
+resolves a concrete parser by extension/MIME, and each parser returns a uniform
+``ParsedDocument`` (text + title + metadata + page_count). PDF/DOCX/HTML parsers
+dynamically import their heavy dependencies (PyMuPDF, python-docx, beautifulsoup4)
+and raise a friendly ``ImportError`` when missing — we translate those into a
+project-level :class:`ParseError` so callers get one stable error type to quarantine.
+
+Plain text and Markdown work with no optional dependencies at all.
+"""
+
 import os
 from typing import Optional
 
-from loguru import logger
+from shared_core.docparse import ParsedDocument, get_parser
+from shared_core.errors import ValidationError
+
+# Extensions we route through shared_core.docparse.
+SUPPORTED_EXTENSIONS = (".txt", ".md", ".markdown", ".html", ".htm", ".pdf", ".docx")
+
+# Extensions that require an optional heavy dependency to be installed.
+OPTIONAL_DEP_EXTENSIONS = (".pdf", ".docx", ".html", ".htm")
 
 
 class ParseError(Exception):
-    """Raised when a document cannot be parsed."""
+    """Raised when a document cannot be parsed.
+
+    Wraps the underlying cause (unsupported format, missing optional dependency,
+    corrupt bytes) so the ingestion pipeline can record a single quarantine reason.
+    """
 
     def __init__(self, message: str, filename: Optional[str] = None):
         self.filename = filename
         super().__init__(message)
 
 
-class ChunkError(Exception):
-    """Raised when chunking fails."""
-
-    pass
-
-
 class DocumentParser:
-    """Reads various file formats and extracts clean text."""
+    """Resolves and runs the appropriate ``shared_core.docparse`` parser."""
+
+    def parse(self, content: bytes, filename: str) -> ParsedDocument:
+        """Parse raw bytes into a :class:`ParsedDocument`.
+
+        Raises :class:`ParseError` for unsupported formats, missing optional
+        dependencies, or any decode/parse failure.
+        """
+        ext = os.path.splitext(filename)[1].lower()
+        try:
+            parser = get_parser(filename)
+        except ValidationError as exc:
+            raise ParseError(
+                f"Unsupported format: {ext or filename}", filename=filename
+            ) from exc
+
+        try:
+            return parser.parse(content, filename=filename)
+        except ImportError as exc:
+            # Optional dependency (pymupdf / python-docx / beautifulsoup4) missing.
+            raise ParseError(str(exc), filename=filename) from exc
+        except ParseError:
+            raise
+        except Exception as exc:  # noqa: BLE001 - normalise to one quarantine reason
+            raise ParseError(
+                f"Failed to parse '{filename}': {exc}", filename=filename
+            ) from exc
 
     def parse_bytes(self, content: bytes, filename: str) -> str:
-        ext = os.path.splitext(filename)[1].lower()
-        if ext == ".txt":
-            return content.decode("utf-8")
-        elif ext == ".md":
-            return self._parse_markdown_bytes(content)
-        elif ext == ".html" or ext == ".htm":
-            return self._parse_html_bytes(content)
-        elif ext == ".pdf":
-            return self._parse_pdf_bytes(content)
-        elif ext == ".docx":
-            return self._parse_docx_bytes(content)
-        else:
-            raise ParseError(f"Unsupported format: {ext}", filename=filename)
+        """Backwards-compatible helper returning only the extracted text."""
+        return self.parse(content, filename).text
 
     def parse_file(self, filepath: str) -> str:
-        with open(filepath, "rb") as f:
-            content = f.read()
+        """Read a file from disk and return its extracted text."""
+        with open(filepath, "rb") as handle:
+            content = handle.read()
         return self.parse_bytes(content, os.path.basename(filepath))
 
-    def _parse_markdown_bytes(self, content: bytes) -> str:
-        import re
-
-        text = content.decode("utf-8")
-        text = re.sub(r"^#{1,6}\s+", "", text, flags=re.MULTILINE)
-        text = re.sub(r"\*\*(.+?)\*\*", r"\1", text)
-        text = re.sub(r"\*(.+?)\*", r"\1", text)
-        text = re.sub(r"`{1,3}[^`]*`{1,3}", "", text)
-        text = re.sub(r"\[([^\]]+)\]\([^)]+\)", r"\1", text)
-        text = re.sub(r"!\[.*?\]\(.*?\)", "", text)
-        text = re.sub(r"^[-*+]\s+", "", text, flags=re.MULTILINE)
-        text = re.sub(r"^>\s+", "", text, flags=re.MULTILINE)
-        return text.strip()
-
-    def _parse_html_bytes(self, content: bytes) -> str:
-        try:
-            from bs4 import BeautifulSoup
-
-            soup = BeautifulSoup(content, "html.parser")
-            for tag in soup(["script", "style", "nav", "footer", "header"]):
-                tag.decompose()
-            return soup.get_text(separator=" ", strip=True)
-        except ImportError:
-            logger.warning("beautifulsoup4 not installed — using naive HTML parsing")
-            text = content.decode("utf-8")
-            text = text.replace("<html>", "").replace("</html>", "")
-            text = text.replace("<body>", "").replace("</body>", "")
-            return text.strip()
-
-    def _parse_pdf_bytes(self, content: bytes) -> str:
-        try:
-            import io
-
-            import pdfplumber
-
-            text_parts = []
-            with pdfplumber.open(io.BytesIO(content)) as pdf:
-                for page in pdf.pages:
-                    page_text = page.extract_text()
-                    if page_text:
-                        text_parts.append(page_text)
-            return "\n\n".join(text_parts)
-        except ImportError as e:
-            raise ParseError(
-                "pdfplumber not installed. Install via 'pip install pdfplumber'"
-            ) from e
-
-    def _parse_docx_bytes(self, content: bytes) -> str:
-        try:
-            import io
-
-            import docx
-
-            doc = docx.Document(io.BytesIO(content))
-            paragraphs = [p.text for p in doc.paragraphs if p.text.strip()]
-            return "\n".join(paragraphs)
-        except ImportError as e:
-            raise ParseError(
-                "python-docx not installed. Install via 'pip install python-docx'"
-            ) from e
+    @staticmethod
+    def file_format(filename: str) -> str:
+        """Return the lowercased extension (without the dot) for a filename."""
+        ext = os.path.splitext(filename)[1].lower()
+        return ext[1:] if ext.startswith(".") else ext

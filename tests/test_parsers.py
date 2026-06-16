@@ -1,107 +1,97 @@
+"""Parser tests — built on ``shared_core.docparse`` via ``DocumentParser``.
+
+Plain text / Markdown / HTML run with the installed optional deps; PDF and DOCX
+are exercised behind ``importorskip`` so the suite stays green with no heavy deps.
+"""
+
 import pytest
+
 from doc_pipeline.parsers import DocumentParser, ParseError
 
 
 class TestDocumentParser:
-    def test_parse_bytes_txt(self, sample_txt_bytes):
+    def test_parse_txt(self, sample_txt_bytes):
         parser = DocumentParser()
-        result = parser.parse_bytes(sample_txt_bytes, "test.txt")
-        assert "sample text document" in result
-        assert "multiple lines" in result
+        parsed = parser.parse(sample_txt_bytes, "test.txt")
+        assert "sample text document" in parsed.text
+        assert "multiple lines" in parsed.text
 
-    def test_parse_bytes_md(self, sample_md_bytes):
+    def test_parse_bytes_returns_text(self, sample_txt_bytes):
         parser = DocumentParser()
-        result = parser.parse_bytes(sample_md_bytes, "test.md")
-        assert "Heading One" in result
-        assert "bold" in result
-        assert "italic" in result
-        assert "link" not in result.lower() or "Link text" in result
-        assert "blockquote" in result
+        text = parser.parse_bytes(sample_txt_bytes, "test.txt")
+        assert isinstance(text, str)
+        assert "sample text document" in text
 
-    def test_parse_bytes_html(self, sample_html_bytes):
+    def test_parse_md_extracts_title(self, sample_md_bytes):
         parser = DocumentParser()
-        result = parser.parse_bytes(sample_html_bytes, "test.html")
-        assert "Title" in result
-        assert "Paragraph text here" in result
-        assert "console.log" not in result
+        parsed = parser.parse(sample_md_bytes, "report.md")
+        assert parsed.title == "Quantum Computing Report"
+        assert "qubits" in parsed.text
 
-    def test_parse_bytes_unsupported_format(self):
+    def test_parse_html_strips_scripts(self, sample_html_bytes):
+        parser = DocumentParser()
+        parsed = parser.parse(sample_html_bytes, "page.html")
+        assert "Paragraph one has content" in parsed.text
+        assert "console.log" not in parsed.text
+        assert parsed.title == "HTML Doc"
+
+    def test_parse_htm_extension(self, sample_html_bytes):
+        parser = DocumentParser()
+        parsed = parser.parse(sample_html_bytes, "page.htm")
+        assert "Heading" in parsed.text
+
+    def test_unsupported_format_raises_parse_error(self):
         parser = DocumentParser()
         with pytest.raises(ParseError, match="Unsupported format"):
-            parser.parse_bytes(b"dummy", "test.xyz")
+            parser.parse(b"dummy", "file.xyz")
 
-    def test_parse_bytes_empty_txt(self):
+    def test_parse_error_carries_filename(self):
         parser = DocumentParser()
-        result = parser.parse_bytes(b"", "empty.txt")
-        assert result == ""
+        with pytest.raises(ParseError) as exc:
+            parser.parse(b"dummy", "bad.xyz")
+        assert exc.value.filename == "bad.xyz"
 
-    def test_parse_bytes_html_no_bs4(self, monkeypatch):
+    def test_empty_txt(self):
         parser = DocumentParser()
-        import builtins
+        parsed = parser.parse(b"", "empty.txt")
+        assert parsed.text == ""
 
-        original_import = builtins.__import__
+    def test_file_format_helper(self):
+        assert DocumentParser.file_format("a.PDF") == "pdf"
+        assert DocumentParser.file_format("a.md") == "md"
+        assert DocumentParser.file_format("noext") == ""
 
-        def mock_import(name, *args, **kwargs):
-            if name == "bs4":
-                raise ImportError("No bs4")
-            return original_import(name, *args, **kwargs)
-
-        monkeypatch.setattr(builtins, "__import__", mock_import)
-        result = parser.parse_bytes(
-            b"<html><body>Simple text</body></html>", "test.html"
-        )
-        assert "Simple text" in result
-
-    def test_parse_bytes_pdf_requires_pdfplumber(self, monkeypatch):
+    def test_parse_file_from_disk(self, tmp_path):
+        path = tmp_path / "doc.txt"
+        path.write_text("hello from disk", encoding="utf-8")
         parser = DocumentParser()
-        import builtins
+        assert "hello from disk" in parser.parse_file(str(path))
 
-        original_import = builtins.__import__
 
-        def mock_import(name, *args, **kwargs):
-            if name == "pdfplumber":
-                raise ImportError("No pdfplumber")
-            return original_import(name, *args, **kwargs)
+class TestOptionalFormats:
+    def test_parse_pdf_when_pymupdf_available(self):
+        fitz = pytest.importorskip("fitz")
+        doc = fitz.open()
+        page = doc.new_page()
+        page.insert_text((72, 72), "Hello PDF world")
+        data = doc.tobytes()
+        doc.close()
 
-        monkeypatch.setattr(builtins, "__import__", mock_import)
-        with pytest.raises(ParseError, match="pdfplumber"):
-            parser.parse_bytes(b"%PDF-1.4\n...", "test.pdf")
-
-    def test_parse_bytes_docx_requires_python_docx(self, monkeypatch):
         parser = DocumentParser()
-        import builtins
+        parsed = parser.parse(data, "doc.pdf")
+        assert "Hello PDF world" in parsed.text
+        assert parsed.page_count == 1
 
-        original_import = builtins.__import__
+    def test_parse_docx_when_python_docx_available(self):
+        docx = pytest.importorskip("docx")
+        import io
 
-        def mock_import(name, *args, **kwargs):
-            if name == "docx":
-                raise ImportError("No docx")
-            return original_import(name, *args, **kwargs)
+        document = docx.Document()
+        document.add_paragraph("First paragraph in docx.")
+        document.add_paragraph("Second paragraph here.")
+        buffer = io.BytesIO()
+        document.save(buffer)
 
-        monkeypatch.setattr(builtins, "__import__", mock_import)
-        with pytest.raises(ParseError, match="python-docx"):
-            parser.parse_bytes(b"PK\x03\x04", "test.docx")
-
-    def test_parse_bytes_with_htm_extension(self, sample_html_bytes):
         parser = DocumentParser()
-        result = parser.parse_bytes(sample_html_bytes, "test.htm")
-        assert "Title" in result
-
-    def test_parse_error_has_filename(self):
-        parser = DocumentParser()
-        with pytest.raises(ParseError) as exc_info:
-            parser.parse_bytes(b"dummy", "bad.xyz")
-        assert exc_info.value.filename == "bad.xyz"
-
-    def test_parse_md_strips_headers(self):
-        parser = DocumentParser()
-        result = parser._parse_markdown_bytes(b"# H1\n## H2\n### H3\ntext")
-        assert result == "H1\nH2\nH3\ntext"
-
-    def test_parse_md_strips_images(self):
-        parser = DocumentParser()
-        result = parser._parse_markdown_bytes(
-            b"text ![alt](img.png) more text"
-        )
-        assert "img.png" not in result
-        assert "more text" in result
+        parsed = parser.parse(buffer.getvalue(), "doc.docx")
+        assert "First paragraph in docx" in parsed.text

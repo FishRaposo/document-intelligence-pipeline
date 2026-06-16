@@ -1,43 +1,57 @@
-from unittest.mock import MagicMock
+import os
+import sys
 
 import pytest
 
+sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "../src")))
 
-@pytest.fixture
-def mock_db():
-    return MagicMock()
+from shared_core.vectorstore import get_vector_store  # noqa: E402
 
+from doc_pipeline.pipeline import DocumentPipeline  # noqa: E402
+from doc_pipeline.storage import InMemoryDocumentStore  # noqa: E402
 
-@pytest.fixture
-def mock_redis():
-    mock = MagicMock()
-    mock.ping.return_value = True
-    return mock
+# --------------------------------------------------------------------------- #
+# Fixture documents (offline; pdf/docx live behind optional-dep skips in tests)
+# --------------------------------------------------------------------------- #
+SAMPLE_MD = """# Quantum Computing Report
+By: Dr. Jane Smith
+
+Published 2024-01-15. Contact research@example.com or https://example.com.
+
+Quantum computing uses qubits to represent information in superposition.
+Modern systems require robust ingestion. The pipeline chunks and embeds text.
+Vectors enable similarity search across a knowledge base for retrieval.
+"""
+
+SAMPLE_HTML = (
+    b"<html><head><title>HTML Doc</title></head><body>"
+    b"<h1>Heading</h1><p>Paragraph one has content.</p>"
+    b"<p>Paragraph two follows along nicely.</p>"
+    b"<script>console.log('noise')</script></body></html>"
+)
+
+SAMPLE_TXT = (
+    b"Plain text document about machine learning and data engineering. "
+    b"It contains several sentences. Each sentence adds context. "
+    b"The ingestion pipeline reads this content and splits it into chunks."
+)
 
 
 @pytest.fixture
 def sample_txt_bytes():
-    return b"This is a sample text document.\nIt has multiple lines.\n\nAnd a blank line."
+    return (
+        b"This is a sample text document.\nIt has multiple lines.\n\nAnd a blank line."
+    )
 
 
 @pytest.fixture
 def sample_md_bytes():
-    return b"# Heading One\n\nThis is **bold** and *italic* text.\n\n- list item 1\n- list item 2\n\n[Link text](http://example.com)\n\n> A blockquote\n\n`inline code`"
+    return SAMPLE_MD.encode("utf-8")
 
 
 @pytest.fixture
 def sample_html_bytes():
-    return b"<html><head><title>Test</title></head><body><h1>Title</h1><p>Paragraph text here.</p><script>console.log('x')</script></body></html>"
-
-
-@pytest.fixture
-def sample_pdf_bytes():
-    return b"%PDF-1.4\n1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n%%EOF"
-
-
-@pytest.fixture
-def sample_docx_bytes():
-    return b"PK\x03\x04\x14\x00\x06\x00"
+    return SAMPLE_HTML
 
 
 @pytest.fixture
@@ -46,3 +60,18 @@ def sample_chunks():
         {"chunk_id": 0, "content": "first chunk", "word_count": 2},
         {"chunk_id": 1, "content": "second chunk", "word_count": 2},
     ]
+
+
+@pytest.fixture
+def store():
+    return InMemoryDocumentStore()
+
+
+@pytest.fixture
+def vector_store():
+    return get_vector_store(offline=True)
+
+
+@pytest.fixture
+def pipeline(store, vector_store):
+    return DocumentPipeline(store, vector_store)

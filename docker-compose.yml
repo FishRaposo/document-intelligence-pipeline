@@ -31,6 +31,23 @@ services:
       timeout: 5s
       retries: 5
 
+  web:
+    build:
+      context: ./frontend
+      target: dev
+    container_name: dip_web
+    ports:
+      - "3000:3000"
+    environment:
+      # Point the dashboard at the FastAPI backend. The UI also ships with a
+      # bundled demo dataset and falls back to it automatically when the API
+      # is unreachable, so this service is useful even with no backend running.
+      NEXT_PUBLIC_API_URL: http://localhost:8000
+    volumes:
+      - ./frontend:/app
+      - /app/node_modules
+      - /app/.next
+
 volumes:
   pgdata:
   redisdata:

@@ -1,65 +1,45 @@
-import pytest
-from doc_pipeline.embeddings import (
-    EmbeddingError,
-    MockEmbeddingGenerator,
-    OpenAIEmbeddingGenerator,
-)
+"""Embedding tests — offline (HashFallbackProvider) by default."""
+
+from doc_pipeline.embeddings import EmbeddingGenerator, MockEmbeddingGenerator
+
+
+class TestEmbeddingGenerator:
+    def test_offline_is_deterministic(self):
+        gen = EmbeddingGenerator(offline=True)
+        v1 = gen.embed_text("hello world")
+        v2 = gen.embed_text("hello world")
+        assert v1 == v2
+        assert all(isinstance(x, float) for x in v1)
+
+    def test_different_text_different_vectors(self):
+        gen = EmbeddingGenerator(offline=True)
+        assert gen.embed_text("alpha") != gen.embed_text("beta")
+
+    def test_no_api_key_falls_back_to_offline(self):
+        gen = EmbeddingGenerator(api_key=None)
+        assert gen.offline is True
+        assert len(gen.embed_text("text")) == gen.dimensions
+
+    def test_embed_chunks_attaches_vectors(self, sample_chunks):
+        gen = EmbeddingGenerator(offline=True)
+        result = gen.embed_chunks(sample_chunks)
+        assert len(result) == 2
+        assert all(len(c["embedding"]) > 0 for c in result)
+
+    def test_dimensions_property(self):
+        gen = EmbeddingGenerator(offline=True)
+        assert gen.dimensions == len(gen.embed_text("anything"))
 
 
 class TestMockEmbeddingGenerator:
-    def test_embed_text_returns_correct_dimension(self):
-        gen = MockEmbeddingGenerator(dimension=10)
-        result = gen.embed_text("hello")
-        assert len(result) == 10
-        assert all(isinstance(v, float) for v in result)
-
-    def test_embed_text_different_inputs_different_vectors(self):
-        gen = MockEmbeddingGenerator(dimension=10)
-        v1 = gen.embed_text("hello")
-        v2 = gen.embed_text("goodbye")
-        assert v1 != v2
-
-    def test_embed_chunks_adds_embedding_field(self, sample_chunks):
-        gen = MockEmbeddingGenerator(dimension=10)
-        result = gen.embed_chunks(sample_chunks)
-        assert len(result) == 2
-        assert len(result[0]["embedding"]) == 10
-        assert len(result[1]["embedding"]) == 10
+    def test_requested_dimension_respected(self):
+        gen = MockEmbeddingGenerator(dimension=128)
+        assert len(gen.embed_text("hello")) == 128
 
     def test_default_dimension(self):
         gen = MockEmbeddingGenerator()
-        result = gen.embed_text("test")
-        assert len(result) == 1536
+        assert len(gen.embed_text("test")) == 1536
 
-
-class TestOpenAIEmbeddingGenerator:
-    def test_init_with_api_key(self):
-        gen = OpenAIEmbeddingGenerator(api_key="sk-test")
-        assert gen.api_key == "sk-test"
-        assert gen.model == "text-embedding-3-small"
-
-    def test_embed_text_requires_openai(self, monkeypatch):
-        gen = OpenAIEmbeddingGenerator(api_key="sk-test")
-        import builtins
-
-        original_import = builtins.__import__
-
-        def mock_import(name, *args, **kwargs):
-            if name == "openai":
-                raise ImportError("No openai")
-            return original_import(name, *args, **kwargs)
-
-        monkeypatch.setattr(builtins, "__import__", mock_import)
-        with pytest.raises(EmbeddingError, match="openai"):
-            gen.embed_text("test")
-
-    def test_embed_chunks_handles_failure_gracefully(self, sample_chunks):
-        gen = OpenAIEmbeddingGenerator(api_key="sk-test")
-
-        def failing_embed(text):
-            raise Exception("API error")
-
-        gen.embed_text = failing_embed
-        result = gen.embed_chunks(sample_chunks)
-        assert len(result) == 2
-        assert result[0]["embedding"] == []
+    def test_deterministic(self):
+        gen = MockEmbeddingGenerator(dimension=64)
+        assert gen.embed_text("same") == gen.embed_text("same")

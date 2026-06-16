@@ -51,19 +51,43 @@ This document records the key architectural and implementation choices made in t
   2. Sentence-based splitting — use NLP sentence tokenization (spaCy, NLTK) to split on sentence boundaries.
   3. Sliding-window word splitting — split every N words with M-word overlap between consecutive chunks.
   4. Semantic splitting — use an embedding model to detect topic shifts and split on semantic boundaries.
-- **Choice**: Option 3 — `SlidingWindowChunker` with `chunk_size=200` words, `overlap=50` words.
-- **Tradeoff**: Word-based sliding windows are fast, deterministic, and require no NLP dependencies. The overlap (25% of chunk size) ensures that a sentence spanning a boundary appears in full in at least one chunk. The downside is that chunk boundaries don't respect semantic or paragraph boundaries — a chunk might split mid-sentence. Sentence-based splitting (option 2) is planned as a future alternative. Semantic splitting (option 4) is powerful but requires an embedding model call per potential split point, which is too expensive for the MVP.
+- **Choice**: Option 3 originally — `SlidingWindowChunker` with `chunk_size=200` words, `overlap=50` words.
+- **Update (superseded)**: The default chunker is now `Chunker`, a thin adapter over `shared_core.docparse.chunk_text`, defaulting to the **semantic** strategy (sentence-aware packing up to a character budget) with `fixed` and `structural` (heading-aware) strategies also available. `SlidingWindowChunker` is retained for backwards compatibility and the demo.
+- **Tradeoff**: Semantic chunking respects sentence boundaries (no mid-sentence splits) without an embedding-model call per split point, since `shared-core` packs by sentence regex rather than embeddings. Word-based sliding windows remain available where deterministic fixed-size windows are preferred.
 
-## Decision 6: Mock Embedding Generator for Development
+## Decision 6: Offline-First Embeddings via `shared_core.embeddings`
 
-- **Context**: The pipeline needs to produce vector embeddings for each chunk. Real embedding APIs (OpenAI `text-embedding-3-small`, sentence-transformers) are either rate-limited, cost money per token, or require GPU resources. During development and testing, the pipeline should produce consistent, reproducible output without external API calls.
+- **Context**: The pipeline needs vector embeddings per chunk. Real embedding APIs (OpenAI `text-embedding-3-small`, sentence-transformers) are rate-limited, cost money, or require GPUs. Development, tests, and the demo must produce consistent output with **no** API calls, while production should use real embeddings when keyed.
 - **Options**:
-  1. Call OpenAI embeddings API directly, even during development.
-  2. Use a local sentence-transformers model (e.g., `all-MiniLM-L6-v2`).
-  3. Implement a deterministic mock that generates vectors from character ordinals.
-  4. Skip embeddings entirely and add them later.
-- **Choice**: Option 3 — `MockEmbeddingGenerator` that computes `sum(ord(c) for c in text[:100]) / 1000.0` and generates a scaled vector.
-- **Tradeoff**: Zero external dependencies, deterministic output (same text always produces same vector), instant execution. The vectors have no semantic meaning, so they can't be used for actual similarity search. The generator is designed to be a drop-in replacement: swap `MockEmbeddingGenerator` for `OpenAIEmbeddingGenerator` (same `embed_text()` interface) when real embeddings are needed. The configurable `dimension` parameter (default: 1536) matches OpenAI's `text-embedding-3-small` output dimensions.
+  1. Call OpenAI directly, even in development.
+  2. Re-implement a local mock generator in this repo.
+  3. Use `shared_core.embeddings.get_embedding_provider(offline=...)` — a deterministic `HashFallbackProvider` with no key, the real `OpenAIEmbeddingProvider` when `OPENAI_API_KEY` is set.
+- **Choice**: Option 3. `EmbeddingGenerator` (`embeddings.py`) is a thin synchronous facade over the shared async providers, selecting offline vs real automatically. `MockEmbeddingGenerator` remains as a backwards-compatible alias for the offline path.
+- **Tradeoff**: We do **not** re-mock what `shared-core` provides, keeping one embedding implementation across the workspace. The offline vectors are deterministic and stable for tests but lexical rather than semantic — real retrieval quality requires a key. The sync facade runs the async provider via `asyncio`, with a thread-offload guard so it works even inside a running event loop (the FastAPI request path).
+
+## Decision 8: Adopt `shared_core.docparse` for Parsing/Chunking/Dedup
+
+- **Context**: The original repo had local parsers (`if/elif` dispatch, naive HTML/Markdown), a local chunker, and no dedup. `shared-core` (v1.3.0) ships a complete ingestion layer: `get_parser` (PDF/DOCX/HTML/Markdown with dynamically imported heavy deps), `chunk_text` (fixed/semantic/structural), and SHA-256 dedup (`compute_hash`, `filter_duplicates`).
+- **Choice**: Replace the local implementations with thin adapters over `shared_core.docparse`. `DocumentParser` resolves a shared parser and normalises missing-optional-dependency / unsupported-format errors into a single `ParseError`. `Chunker` wraps `chunk_text`; `dedup.py` wraps the dedup helpers.
+- **Tradeoff**: Far less bespoke code to maintain, real PDF/DOCX/HTML parsing for free, and a uniform `ParsedDocument` (text + title + metadata + page count) that powers metadata extraction. The cost is a hard dependency on `shared-core[docparse]` for the heavy formats — without it, PDF/DOCX raise a clean `ParseError` and are quarantined rather than crashing.
+
+## Decision 9: DB Persistence by Default with In-Memory Fallback (`db_available` probe)
+
+- **Context**: The showcase must run and be **fully tested with no database**, yet demonstrate real persistence. The migrated sibling services established a `db_available` probe pattern.
+- **Choice**: `db.py` probes the database on startup (`SELECT 1`, create tables) and `build_store()` returns a `DatabaseDocumentStore` (PostgreSQL) or `InMemoryDocumentStore`. Both implement the same interface, so `DocumentPipeline`, the API, and the worker are backend-agnostic. The vector store mirrors this (pgvector vs `InMemoryVectorStore`). Alembic provides migrations.
+- **Tradeoff**: Tests and the demo run instantly with zero infrastructure; production gets durable, queryable storage by setting `DATABASE_URL`. Chunk embeddings are stored as JSON (not a native `pgvector` column) in the relational table so the schema is SQLite-testable; semantic search uses the dedicated vector store instead.
+
+## Decision 10: Error Quarantine over Fail-Fast
+
+- **Context**: A bad file in a batch (unsupported format, missing parser dependency, corrupt bytes) must not abort the whole batch, and operators need to see and retry failures.
+- **Choice**: `DocumentPipeline.ingest` never raises — failures are recorded in a quarantine (with the original bytes, base64-encoded), surfaced via `GET /quarantine`, and reprocessable via `POST /quarantine/{id}/reprocess`.
+- **Tradeoff**: Resilient batch ingestion and a clear operator workflow, at the cost of storing failed file bytes (bounded by retention policy — see roadmap).
+
+## Decision 11: Heuristic Entity Extraction over spaCy NER
+
+- **Context**: Entity extraction (emails, URLs, names) is a showcase feature, but a trained NER model (spaCy) is a heavy dependency and slow to load — at odds with offline-first, fast tests.
+- **Choice**: `entities.py` uses regex + heuristics: emails, URLs (trailing-punctuation-trimmed), phone shapes, and capitalised n-grams (1–3 tokens, stopword-filtered) as a proper-noun proxy.
+- **Tradeoff**: Zero heavy dependencies, instant, deterministic, good enough to demonstrate the capability and feed a dashboard. It produces false positives on capitalised phrases and misses lowercase entities — a trained NER model is the documented Phase 4 upgrade.
 
 ## Decision 7: Format-Specific Parser Dispatch over Plugin Architecture
 
@@ -72,5 +96,5 @@ This document records the key architectural and implementation choices made in t
   1. Plugin/registry architecture — parsers register themselves via decorators or entry points; new formats are added without touching the dispatcher.
   2. Strategy pattern — pass a parser implementation at runtime based on configuration.
   3. Simple dispatch — `if/elif` chain in `DocumentParser.parse_file()` based on file extension.
-- **Choice**: Option 3 — direct `if/elif` dispatch in `DocumentParser.parse_file()` using `os.path.splitext()`.
-- **Tradeoff**: The simplest approach for a small, known set of formats. Adding a new format means adding one `elif` branch and one `_parse_*` method — about 5 lines of code. The plugin architecture (option 1) is more extensible but adds significant complexity (metaclasses, registry dicts, dynamic imports) for diminishing returns when the format list is small and static. If the format count grows beyond ~8, refactoring to a registry pattern would be worthwhile.
+- **Choice (superseded)**: Originally a direct `if/elif` dispatch. Now dispatch is delegated to `shared_core.docparse.get_parser`, which resolves a parser by extension/MIME from a registered tuple of `BaseParser` subclasses. `DocumentParser` is a thin adapter that calls it and normalises errors.
+- **Tradeoff**: We get a maintained, extensible parser registry (PDF/DOCX/HTML/Markdown) for free, with heavy deps dynamically imported. Adding a format is a `shared-core` concern, not a per-project one — eliminating duplicated parsing logic across the workspace.

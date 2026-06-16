@@ -2,107 +2,83 @@
 
 ## What This Is
 
-A multi-stage document processing pipeline that ingests raw files (txt, md, html — with planned pdf/docx support), cleans extracted text, splits it into overlapping semantic chunks using a sliding-window algorithm, generates vector embeddings, and exports structured JSONL for downstream RAG systems. Part of Wave 1 in the showcase portfolio. Feeds into `rag-evaluation-lab` and `personal-knowledge-base-os`.
+A multi-stage document ingestion pipeline: parse (txt/md/html/pdf/docx) → clean → extract metadata + entities → chunk → content-hash dedup → embed → persist → index for vector search. Offline-first (runs and is fully tested with no API keys and no database) and real-when-keyed (OpenAI embeddings + PostgreSQL/pgvector when configured). Built on `shared-core` v1.3.0. Feeds `rag-evaluation-lab` and `personal-knowledge-base-os`.
 
 ## Commands
 
 ```bash
-make install          # pip install -e ../shared-core && pip install -r requirements.txt
-make dev              # python src/doc_pipeline/main.py (FastAPI on :8000)
-make test             # pytest (runs tests/test_core.py)
+make install          # pip install -e ../shared-core[...]; pip install -e .[dev]
+make dev              # python -m doc_pipeline.main (FastAPI on :8000)
+make test             # pytest
 make lint             # ruff check .
 make format           # ruff format .
 make typecheck        # pyright src/
+make demo             # python examples/run_demo.py (full offline pipeline)
+make worker           # celery -A src.doc_pipeline.worker worker --loglevel=info
+make migrate          # alembic revision --autogenerate -m "auto"
+make upgrade          # alembic upgrade head
 make docker-up        # docker compose up -d (Postgres pgvector:pg16 + Redis 7)
 make docker-down      # docker compose down
-make demo             # python examples/run_demo.py (end-to-end pipeline demo)
-make clean            # remove __pycache__, .pytest_cache, etc.
 ```
+
+Run a single test: `pytest tests/test_pipeline.py -q`.
 
 ## Entry Point
 
-`src/doc_pipeline/main.py` — FastAPI app with two endpoints:
-- `POST /ingest` — accepts `UploadFile`, decodes UTF-8, runs `clean_extracted_text()` → `SlidingWindowChunker.chunk_text()`, returns chunks as JSON
-- `GET /health` — checks PostgreSQL (`DatabaseManager`) and Redis (`RedisManager`) connectivity
+`src/doc_pipeline/main.py` — FastAPI app. On startup a `db_available` probe selects PostgreSQL (+ pgvector) or in-memory backends. Endpoints:
 
-Imports: `AppConfig` from `.config`, `DocumentParser` from `.parsers`, `clean_extracted_text` from `.cleaners`, `SlidingWindowChunker` from `.chunkers`, `application_error_handler` from `.errors`.
+- `POST /ingest` — file upload (multipart) → full pipeline.
+- `POST /ingest/text` — raw text/md/html string (JSON body).
+- `POST /ingest/batch` — sync, or `async_mode: true` → Celery `batch_ingest_task`.
+- `GET /documents`, `GET /documents/{id}`, `GET /documents/{id}/chunks` — browse.
+- `POST /search` — embed query, cosine-rank stored chunks.
+- `GET /quarantine`, `POST /quarantine/{id}/reprocess` — failed-file workflow.
+- `GET /export/{id}` — RAG-ready JSONL.
+- `GET /health` — DB + Redis via `shared_core.health.check_health`.
 
 ## Source Modules
 
 ```
 src/doc_pipeline/
-├── __init__.py       # Package marker
-├── main.py           # FastAPI app, /ingest and /health endpoints
-├── config.py         # AppConfig(BaseAppConfig) — APP_NAME override
-├── parsers.py        # DocumentParser — dispatches .txt/.md/.html parsing
-├── cleaners.py       # clean_extracted_text() — regex whitespace normalization
-├── chunkers.py       # SlidingWindowChunker — overlapping word-based chunks
-├── embeddings.py     # MockEmbeddingGenerator — deterministic hash-based vectors
-├── exporters.py      # JSONLExporter — writes chunk dicts as JSONL
-├── worker.py         # Celery app + sample_background_task (placeholder)
-└── errors.py         # application_error_handler for BaseApplicationError
+├── main.py        # FastAPI app + all endpoints; startup db probe
+├── pipeline.py    # DocumentPipeline orchestrator (+ search, quarantine reprocess)
+├── parsers.py     # DocumentParser — adapter over shared_core.docparse.get_parser
+├── cleaners.py    # clean_extracted_text()
+├── metadata.py    # extract_metadata() — title/author/dates/counts
+├── entities.py    # extract_entities() — emails/urls/phones/capitalised n-grams
+├── chunkers.py    # Chunker (shared_core chunk_text) + SlidingWindowChunker
+├── dedup.py       # content_hash, dedup_chunks (shared_core compute_hash/filter_duplicates)
+├── embeddings.py  # EmbeddingGenerator (shared_core embeddings; offline default)
+├── exporters.py   # JSONLExporter, to_rag_records
+├── storage.py     # InMemoryDocumentStore (offline default)
+├── storage_db.py  # DatabaseDocumentStore (PostgreSQL; same interface)
+├── db.py          # check_db()/build_store() — db_available probe + fallback
+├── models.py      # Document, Chunk, ProcessingJob, QuarantineEntry
+├── worker.py      # Celery process_document_task / batch_ingest_task (no broker needed)
+├── config.py      # AppConfig(BaseAppConfig)
+└── errors.py      # re-exports shared_core.errors.application_error_handler
 ```
+
+## shared-core Usage (do NOT re-mock these)
+
+`docparse` (get_parser, chunk_text, ChunkStrategy, compute_hash, filter_duplicates, ParsedDocument) · `embeddings` (get_embedding_provider, HashFallbackProvider) · `vectorstore` (get_vector_store, InMemoryVectorStore, VectorRecord) · `database` (DatabaseManager, Base, UUIDMixin, TimestampMixin) · `tasks` (create_celery_app) · `health`, `errors`, `logging`, `config` · `testing` (MockDatabase, MockRedisClient) in tests.
+
+## Persistence
+
+Default PostgreSQL via `db.py`'s probe; transparent in-memory fallback for tests/demo. Tables: `documents`, `chunks`, `processing_jobs`, `quarantine`. Alembic migration in `alembic/versions/`. Chunk embeddings stored as JSON (SQLite-testable); semantic search uses `shared_core.vectorstore` (pgvector with a DB, in-memory otherwise).
+
+## Tests
+
+`tests/` — offline, no network, no real DB (uses `MockDatabase` + offline providers). Covers every core module, the end-to-end flow, persistence (in-memory + SQLite), every API endpoint (success + error), the worker, and a demo smoke test. ~127 tests.
 
 ## Docker Services
 
-- **postgres**: `pgvector/pgvector:pg16` on `:5432` — container name `template_postgres`
-- **redis**: `redis:7-alpine` on `:6379` — container name `template_redis`
-
-## Layout
-
-```
-document-intelligence-pipeline/
-├── src/doc_pipeline/        # All source code (see modules above)
-├── tests/test_core.py       # Health endpoint test
-├── examples/run_demo.py     # End-to-end pipeline demo (parse → clean → chunk → embed)
-├── docs/                    # architecture.md, design-decisions.md, failure-modes.md, roadmap.md, security.md
-├── .github/workflows/ci.yml # ruff check, ruff format --check, pytest
-├── docker-compose.yml       # Postgres + Redis
-├── Makefile                 # Standard targets
-├── .env.example             # APP_NAME, DATABASE_URL, REDIS_URL, API keys
-├── pyproject.toml           # Project metadata (description still template placeholder)
-├── requirements.txt         # fastapi, uvicorn, pydantic, httpx, celery, redis, sqlalchemy, loguru, pyyaml
-├── ruff.toml                # Python 3.10, line-length 88, E/W/F/I/C/B rules
-├── pyrightconfig.json       # basic type checking mode
-└── pytest.ini               # testpaths = tests, verbose
-```
-
-## Current State
-
-**Skeleton with functional pipeline stages.** The core parse → clean → chunk path works end-to-end for plain text files (verified via `examples/run_demo.py`). However:
-
-- `DocumentParser` only handles `.txt`, `.md`, `.html` — PDF/DOCX raise `ValueError`
-- HTML parsing uses naive string replacement, not DOM parsing
-- Markdown parsing only strips `#` characters
-- `POST /ingest` decodes raw bytes as UTF-8 — bypasses `DocumentParser` entirely, no format detection
-- `MockEmbeddingGenerator` produces deterministic vectors, not real embeddings
-- `JSONLExporter` exists but is not wired into the `/ingest` endpoint
-- `worker.py` has a placeholder task (`sample_background_task`) — no document processing task
-- No database schema exists — PostgreSQL container runs but no tables are created
-- `pyproject.toml` description is still the template placeholder
-
-## Key Dependencies
-
-Beyond shared-core (`config`, `database`, `redis`, `logging`, `errors`):
-
-| Package | Purpose |
-|---------|---------|
-| `celery` | Background document processing tasks |
-| `redis` | Celery broker and result backend |
-| `sqlalchemy` | Database ORM (used in health check) |
-| `loguru` | Structured logging |
-| `pyyaml` | Configuration parsing |
-| `httpx` | HTTP client (for future webhook callbacks) |
-
-**Not yet added but needed:** `pdfplumber` or `pymupdf` (PDF parsing), `python-docx` (DOCX), `beautifulsoup4` (HTML), `openai` or `sentence-transformers` (real embeddings), `pgvector` (SQLAlchemy vector extension).
+- **postgres**: `pgvector/pgvector:pg16` on `:5432` — container `dip_postgres`
+- **redis**: `redis:7-alpine` on `:6379` — container `dip_redis`
 
 ## When to Update This AGENTS.md
 
-- When new parsers are added (PDF, DOCX) or parser dispatch logic changes
-- When `POST /ingest` is updated to use `DocumentParser` or support binary uploads
-- When Celery tasks are created for async document processing
-- When database schema/models are added for documents and chunks
-- When `MockEmbeddingGenerator` is replaced with real embedding integration
-- When new API endpoints are added (batch upload, status, export)
-- When Docker Compose services change (e.g., adding a Celery worker service)
-- When project moves from skeleton to functional state
+- New endpoints, pipeline stages, or `shared-core` modules adopted.
+- New ORM models / migrations.
+- Worker task changes.
+- Changes to the offline-first / db_available behavior.

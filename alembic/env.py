@@ -10,7 +10,12 @@ from sqlalchemy import create_engine
 
 from alembic import context
 from doc_pipeline.config import AppConfig
-from doc_pipeline.models import Chunk, Document  # noqa: F401
+from doc_pipeline.models import (  # noqa: F401
+    Chunk,
+    Document,
+    ProcessingJob,
+    QuarantineEntry,
+)
 
 config = context.config
 
